@@ -10,7 +10,7 @@ from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 
 import pytest
 from invisible_core import GeoTimezoneError, SessionGeo, SessionLocale
-from invisible_playwright.async_api import prepare_session_geo
+from invisible_core import prepare_session_geo
 
 from src import utils
 
@@ -152,43 +152,29 @@ async def test_proxy_sessions_resolve_their_own_egress(
 EGRESS_IP = "203.0.113.7"
 
 
-def test_launches_reuse_one_egress_and_geoip_lookup():
-    """Seam guard: the launcher's geo step goes through the remembered lookups."""
-    with (
-        patch.object(utils.discover_egress_ip, "lookup", return_value=EGRESS_IP) as ip,
-        patch.object(
-            utils.ensure_geoip_mmdb, "lookup", return_value=Path("geo.mmdb")
-        ) as geoip,
-        patch("invisible_core._geo.ip_to_coordinates", return_value=(52.5, 13.4)),
-    ):
-        results = [
-            prepare_session_geo("Europe/Berlin", None, "de-DE") for _ in range(3)
-        ]
+def test_core_egress_and_geoip_lookups_are_not_monkeypatched():
+    """Modern invisible-core owns its network/geo lifecycle; Byparr does not patch it."""
+    import invisible_core
+    import invisible_core._geo as native_geo
 
-    ip.assert_called_once_with()
-    geoip.assert_called_once_with()
-    assert {geo.egress_ip for geo in results} == {EGRESS_IP}
+    assert native_geo.discover_egress_ip is not utils.discover_egress_ip
+    assert utils.ensure_geoip_mmdb.lookup is invisible_core.ensure_geoip_mmdb
 
 
-def test_failed_lookup_is_skipped_until_the_window_ends(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """A failure is kept for GEO_RETRY_SECONDS instead of being repaid per launch."""
-    with (
-        patch.object(
-            utils.discover_egress_ip, "lookup", side_effect=GeoTimezoneError("blocked")
-        ) as ip,
-        patch.object(utils.ensure_geoip_mmdb, "lookup"),
-    ):
+def test_local_failed_lookup_backoff_is_bounded(monkeypatch: pytest.MonkeyPatch):
+    """The app's fallback lookup still throttles repeated failures."""
+    with patch.object(
+        utils.discover_egress_ip, "lookup", side_effect=GeoTimezoneError("blocked")
+    ) as ip:
         for _ in range(2):
-            assert prepare_session_geo("UTC", None, "en-US").egress_ip is None
+            with pytest.raises(GeoTimezoneError, match="blocked"):
+                utils.discover_egress_ip()
         assert ip.call_count == 1
-
         monkeypatch.setattr(utils.discover_egress_ip, "retry_seconds", 0)
         utils.discover_egress_ip.clear()
-        for _ in range(2):
-            prepare_session_geo("UTC", None, "en-US")
-        assert ip.call_count == 3  # noqa: PLR2004
+        with pytest.raises(GeoTimezoneError):
+            utils.discover_egress_ip()
+        assert ip.call_count == 2
 
 
 def test_failed_geoip_download_is_retried_after_a_short_window():
@@ -285,42 +271,20 @@ async def drain_browser(**kwargs: str | None) -> None:
 
 @pytest.mark.asyncio
 async def test_warm_up_runs_once_before_any_browser(monkeypatch: pytest.MonkeyPatch):
-    """Concurrent first launches wait for one warm-up instead of each fetching."""
+    """Concurrent launches await one application warm-up, not private core patches."""
     monkeypatch.setattr(utils, "_warmed", False)
-
-    def slow(value: object) -> Callable[..., object]:
-        def lookup(**_: object) -> object:
-            time.sleep(0.05)
-            return value
-
-        return lookup
-
     launcher = fake_invisible_playwright()
-    seen: list[tuple[bool, int, int]] = []
     with (
         patch("src.utils.PROXY_SERVER", None),
         patch("src.utils.BROWSER_LOCALE", "de-DE"),
         patch("src.utils.InvisiblePlaywright", launcher),
-        patch.object(
-            utils.discover_egress_ip, "lookup", side_effect=slow(EGRESS_IP)
-        ) as ip,
-        patch.object(
-            utils.ensure_geoip_mmdb, "lookup", side_effect=slow(Path("geo.mmdb"))
-        ) as geoip,
-        patch("invisible_core._geo.ip_to_coordinates", return_value=(52.5, 13.4)),
-        patch("invisible_core._geo.ip_to_timezone", return_value="Europe/Berlin"),
+        patch("src.utils.prepare_session_geo", return_value=BERLIN) as geo,
+        patch.object(utils.ensure_geoip_mmdb, "lookup", return_value=Path("geo.mmdb")) as geoip,
     ):
-
-        def record(**_: object) -> object:
-            seen.append((utils._warmed, ip.call_count, geoip.call_count))  # noqa: SLF001
-            return DEFAULT
-
-        launcher.side_effect = record
         await asyncio.gather(*(drain_browser() for _ in range(3)))
-
-    ip.assert_called_once_with()
+    geo.assert_called_once()
     geoip.assert_called_once_with()
-    assert seen == [(True, 1, 1)] * 3
+    assert launcher.call_count == 3
     assert launcher.call_args.kwargs["timezone"] == "Europe/Berlin"
 
 
@@ -328,7 +292,7 @@ async def test_warm_up_runs_once_before_any_browser(monkeypatch: pytest.MonkeyPa
 async def test_failed_warm_up_still_serves_with_the_fallback(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):
-    """A failed warm-up logs one warning per fact and browsers use the fallback."""
+    """Failed upstream geo/GeoIP warm-up keeps the documented fallback."""
     monkeypatch.setattr(utils, "_warmed", False)
     caplog.set_level(logging.WARNING, logger="uvicorn.error")
     launcher = fake_invisible_playwright()
@@ -336,29 +300,18 @@ async def test_failed_warm_up_still_serves_with_the_fallback(
         patch("src.utils.PROXY_SERVER", None),
         patch("src.utils.get_localzone_name", return_value=None),
         patch("src.utils.InvisiblePlaywright", launcher),
-        patch.object(
-            utils.discover_egress_ip, "lookup", side_effect=GeoTimezoneError("blocked")
-        ) as ip,
-        patch.object(
-            utils.ensure_geoip_mmdb,
-            "lookup",
-            side_effect=RuntimeError("geoip mmdb unavailable"),
-        ) as geoip,
+        patch("src.utils.prepare_session_geo", side_effect=GeoTimezoneError("blocked")) as geo,
+        patch.object(utils.ensure_geoip_mmdb,"lookup",side_effect=RuntimeError("geoip mmdb unavailable")) as geoip,
     ):
         await utils.warm_up()
         assert utils._warmed is True  # noqa: SLF001
-
-        messages = [
-            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
-        ]
-        assert len([m for m in messages if "GeoIP" in m]) == 1
-        assert len([m for m in messages if "timezone" in m]) == 1
-
+        messages=[r.getMessage() for r in caplog.records if r.levelno>=logging.WARNING]
+        assert sum("GeoIP" in x for x in messages)==1
+        assert sum("timezone" in x for x in messages)==1
         await drain_browser()
-
-    kwargs = launcher.call_args.kwargs
-    assert (kwargs["timezone"], kwargs["locale"]) == ("UTC", "en-US")
-    assert (ip.call_count, geoip.call_count) == (1, 1)
+    kwargs=launcher.call_args.kwargs
+    assert (kwargs["timezone"],kwargs["locale"])==("UTC","en-US")
+    assert (geo.call_count,geoip.call_count)==(1,1)
 
 
 @pytest.mark.asyncio

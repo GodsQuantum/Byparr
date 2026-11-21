@@ -7,9 +7,13 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Annotated, NamedTuple, cast
 
 from fastapi import Header
-from invisible_core import GeoTimezoneError, SessionGeo, prepare_session_geo
+from invisible_core import (
+    GeoTimezoneError,
+    SessionGeo,
+    ensure_geoip_mmdb as upstream_ensure_geoip_mmdb,
+    prepare_session_geo,
+)
 from invisible_core import _geo as invisible_geo  # pyright: ignore[reportPrivateUsage]
-from invisible_core import download as invisible_download
 from invisible_playwright.async_api import InvisiblePlaywright
 from playwright.async_api import Browser, BrowserContext, Page
 from pydantic import BaseModel, Field
@@ -117,14 +121,12 @@ class RememberedLookup[T]:
             self._failures = 0
 
 
-# shortcut: private invisible-core seams (no public parameter in 55.50); tests/utils_test.py guards them, switch to an upstream option if one appears.
+# Application caches for warm-up and fallback only; upstream owns its per-launch
+# discovery lifecycle. Never monkeypatch private invisible-core functions.
 discover_egress_ip = RememberedLookup(invisible_geo.discover_egress_ip)
-ensure_geoip_mmdb = RememberedLookup(
-    invisible_download.ensure_geoip_mmdb,  # pyright: ignore[reportPrivateImportUsage]
-    GEOIP_RETRY_SECONDS,
-)
-invisible_geo.discover_egress_ip = discover_egress_ip
-invisible_download.ensure_geoip_mmdb = ensure_geoip_mmdb  # pyright: ignore[reportPrivateImportUsage]
+# Keep application-level warm-up bounded, but do not monkeypatch private
+# invisible-core internals: modern releases use their own per-launch seams.
+ensure_geoip_mmdb = RememberedLookup(upstream_ensure_geoip_mmdb, GEOIP_RETRY_SECONDS)
 
 
 class BrowserGeo(NamedTuple):
